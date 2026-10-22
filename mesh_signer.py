@@ -18,17 +18,19 @@ from solders.message import Message
 POCKETBASE_URL = "https://pocketbase-production-2285.up.railway.app"
 pb = PocketBase(POCKETBASE_URL)
 
-# --- SOLANA CONFIGURATION ---
-SOLANA_RPC_URL = "https://api.devnet.solana.com" # Devnet for testing
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 solana_client = Client(SOLANA_RPC_URL)
 
-# REPLACE THIS WITH YOUR TREASURY PRIVATE KEY (Base58)
-TREASURY_PRIVATE_KEY = "3EVJfeTqS4VbpmUsTWVJda1tfhrTWSXeMEunFBAGDzCMhVMzmhYVzm5SLddaZWFNb9dg8ozK22v3fcfLnavA3MeY"
+# Your Treasury Wallet Private Key
+TREASURY_PRIVATE_KEY = "Uv7ZpoQeHfVH7J7Pbj2CJEpszY6XjDbV9xojnpVKY4d9koPyjtyHJvUmVopya35hsUV78fw66TwVvX4C35L464M"
 treasury_keypair = Keypair.from_bytes(base58.b58decode(TREASURY_PRIVATE_KEY))
 print(f"Treasury Wallet: {treasury_keypair.pubkey()}")
 
-# How much SOL to airdrop per request (0.001 SOL)
-AIRDROP_AMOUNT = 1000000 
+AIRDROP_AMOUNT = 10000
+
+# --- TOKEN GATE CONFIGURATION ---
+# PASTE THE MINT ADDRESS OF YOUR VIP TOKEN HERE
+TOKEN_MINT_ADDRESS = "EP2xruNUKc7vx9Kn5Ch4qu8zZEBTigmJ3MoSpLZ3UpMD"
 
 REGIONS = {
     "JAPAN": { "puzzle_id": "puzzle-japan", "prefix": "JPN" },
@@ -52,11 +54,36 @@ def generate_code(prefix):
     digits = ''.join(random.choices(string.digits, k=4))
     return f"{prefix}-{digits}"
 
+def check_token_gate(wallet_address):
+    try:
+        # If no mint address is set, we skip the gate for testing
+        if TOKEN_MINT_ADDRESS == "YOUR_VIP_TOKEN_MINT_ADDRESS_HERE":
+            print("⚠️ WARNING: Token Gate is disabled (no mint address set).")
+            return True 
+            
+        wallet_pubkey = Pubkey.from_string(wallet_address)
+        mint_pubkey = Pubkey.from_string(TOKEN_MINT_ADDRESS)
+        
+        # Get token accounts by owner
+        from solana.rpc.types import TokenAccountOpts
+        
+        response = solana_client.get_token_accounts_by_owner(
+            wallet_pubkey,
+            TokenAccountOpts(mint=mint_pubkey)
+        )
+        
+        # If there are accounts with a balance > 0, they pass the gate
+        if len(response.value) > 0:
+            return True
+        return False
+    except Exception as e:
+        print(f"Token Gate Error: {e}")
+        return False
+
 def send_sol_airdrop(recipient_wallet):
     try:
         recipient_pubkey = Pubkey.from_string(recipient_wallet)
         
-        # Create transfer instruction
         transfer_ix = transfer(
             TransferParams(
                 from_pubkey=treasury_keypair.pubkey(),
@@ -65,15 +92,12 @@ def send_sol_airdrop(recipient_wallet):
             )
         )
         
-        # Get recent blockhash
         recent_blockhash = solana_client.get_latest_blockhash().value.blockhash
         
-        # Create and sign transaction
         msg = Message.new_with_blockhash([transfer_ix], treasury_keypair.pubkey(), recent_blockhash)
         txn = Transaction.new_unsigned(msg)
         txn.sign([treasury_keypair], recent_blockhash)
         
-        # Send transaction
         result = solana_client.send_transaction(txn)
         print(f"✅ AIRDROP SUCCESS: https://explorer.solana.com/tx/{result.value}?cluster=devnet")
         return True
@@ -99,14 +123,24 @@ def onReceive(packet, interface):
                     wallet = "UNLINKED"
                     try:
                         links = pb.collection('mesh_links').get_full_list(
-                        query_params={"filter": f"node_id='{sender}'"}
+                            query_params={"filter": f"node_id='{sender}'"}
                         )
-
                         if len(links) > 0:
                             wallet = links[0].wallet
                             print(f"Found linked wallet: {wallet}")
                     except Exception as e:
                         print(f"Link Lookup Error: {e}")
+
+                    # --- TOKEN GATE CHECK ---
+                    if wallet == "UNLINKED":
+                        interface.sendText("ERROR: WALLET NOT LINKED.", destinationId=sender)
+                        print("Rejected: Wallet not linked.")
+                        return
+                        
+                    if not check_token_gate(wallet):
+                        interface.sendText("ACCESS DENIED: VIP TOKEN REQUIRED.", destinationId=sender)
+                        print(f"Rejected: Wallet {wallet} does not hold the VIP token.")
+                        return
 
                     # Generate the dynamic code
                     new_code = generate_code(region["prefix"])
@@ -121,15 +155,13 @@ def onReceive(packet, interface):
                             "expires_at": expires
                         })
                         
-                        # Send the code back over radio
                         response = f"CODE: {new_code}. EXPIRES IN 5 MIN."
                         interface.sendText(response, destinationId=sender)
                         print(f"Leased {new_code} for {region_key} to {wallet}")
                         
-                        # TRIGGER AIRDROP if wallet is linked
-                        if wallet != "UNLINKED":
-                            print(f"Initiating Solana airdrop to {wallet}...")
-                            send_sol_airdrop(wallet)
+                        # TRIGGER AIRDROP
+                        print(f"Initiating Solana airdrop to {wallet}...")
+                        send_sol_airdrop(wallet)
                         
                     except Exception as e:
                         print(f"Database Error: {e}")
